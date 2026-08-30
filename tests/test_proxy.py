@@ -110,6 +110,45 @@ def test_streaming_response_is_sse(monkeypatch):
     assert "data: [DONE]" in response.text
 
 
+def test_rate_limited_upstream_is_retried_once(monkeypatch):
+    class Fake429Response:
+        status_code = 429
+        text = '{"error":{"message":"Rate limit exceeded. Please try again later.","type":"rate_limit_error","code":"rate_limit_exceeded"}}'
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {"error": {"message": "Rate limit exceeded. Please try again later.", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+
+    class Fake200Response:
+        status_code = 200
+        text = '{"id":"chatcmpl-1","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"TEST OK"}}]}'
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {"id": "chatcmpl-1", "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": "TEST OK"}}]}
+
+    calls = {"count": 0}
+
+    async def fake_post(self, url, headers=None, json=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return Fake429Response()
+        return Fake200Response()
+
+    monkeypatch.setattr(main.httpx.AsyncClient, "post", fake_post)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "mimo-v2.5-free",
+            "messages": [{"role": "user", "content": "Reply with exactly: TEST OK"}],
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+    assert calls["count"] == 2
+
+
 def test_successful_model_request_returns_upstream_json(monkeypatch):
     class FakeResponse:
         status_code = 200

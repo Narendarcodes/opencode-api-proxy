@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -55,8 +56,13 @@ def extract_message_from_body(raw_body: Any) -> Optional[str]:
 
 def classify_upstream_error(status_code: int, raw_detail: Any) -> Dict[str, str]:
     detail = raw_detail.decode("utf-8", errors="replace") if isinstance(raw_detail, bytes) else str(raw_detail)
-    message = extract_message_from_body(json.loads(detail)) if detail.strip().startswith("{") else detail
-    if not message:
+    message = detail
+    if detail.strip().startswith("{"):
+        try:
+            message = extract_message_from_body(json.loads(detail)) or detail
+        except (TypeError, ValueError):
+            message = detail
+    if not message or message == "None":
         message = "Upstream request failed"
 
     lowered = message.lower()
@@ -73,6 +79,38 @@ def classify_upstream_error(status_code: int, raw_detail: Any) -> Dict[str, str]
     if status_code >= 500:
         return {"message": message, "type": "upstream_error", "code": "upstream_error"}
     return {"message": message, "type": "upstream_error", "code": "upstream_error"}
+
+
+async def send_chat_completion_with_retry(client: httpx.AsyncClient, url: str, headers: Dict[str, str], body: Dict[str, Any], is_stream: bool, request_id: str):
+    max_attempts = 2
+    last_response = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if is_stream:
+                upstream_request = client.build_request("POST", url, headers=headers, json=body)
+                response = await client.send(upstream_request, stream=True)
+            else:
+                response = await client.post(url, headers=headers, json=body)
+        except Exception:
+            raise
+
+        if response.status_code == 429 and attempt < max_attempts:
+            retry_after = response.headers.get("retry-after")
+            sleep_seconds = 1.0
+            try:
+                if retry_after:
+                    sleep_seconds = max(1.0, float(retry_after))
+            except ValueError:
+                pass
+            logger.warning("request_id=%s upstream_rate_limited retrying in %.1f seconds attempt=%s/%s", request_id, sleep_seconds, attempt + 1, max_attempts)
+            await asyncio.sleep(sleep_seconds)
+            last_response = response
+            continue
+
+        last_response = response
+        return response
+
+    return last_response
 
 
 def upstream_error(status_code: int, detail: Any, request_id: str) -> JSONResponse:
@@ -213,11 +251,7 @@ async def chat_completions(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            if is_stream:
-                upstream_request = client.build_request("POST", upstream_url, headers=headers, json=body)
-                stream_response = await client.send(upstream_request, stream=True)
-            else:
-                stream_response = await client.post(upstream_url, headers=headers, json=body)
+            stream_response = await send_chat_completion_with_retry(client, upstream_url, headers, body, is_stream, request_id)
     except httpx.TimeoutException as exc:
         logger.exception("request_id=%s upstream_timeout url=%s", request_id, upstream_url)
         return JSONResponse(
